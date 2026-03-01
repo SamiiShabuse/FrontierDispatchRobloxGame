@@ -419,7 +419,6 @@ local function buildPayloadFor(player)
 		payload.player.upgrades = pdata.Upgrades or {}
 		payload.player.route = pdata.SelectedRoute
 		payload.player.readyForDepot = pdata.ReadyForDepot == true
-		payload.blockedTowns = pdata.BlockedTowns or {}
 		payload.routeOptions = {}
 
 		local routeTown = pdata.SelectedRoute and pdata.SelectedRoute.town
@@ -451,18 +450,6 @@ local function broadcast()
 	for _, player in ipairs(Players:GetPlayers()) do
 		pushUI(player)
 	end
-end
-
-local function canDeliverToTown(pdata, townName)
-	local blockedUntil = (pdata.BlockedTowns or {})[townName]
-	if not blockedUntil then
-		return true
-	end
-	if os.clock() >= blockedUntil then
-		pdata.BlockedTowns[townName] = nil
-		return true
-	end
-	return false
 end
 
 local function unlockTelegraphIfEarned(player, pdata)
@@ -544,12 +531,6 @@ local function onDropZoneTouched(townName, hit)
 
 	local pdata = getPlayerData(player)
 	if not pdata then
-		return
-	end
-
-	if not canDeliverToTown(pdata, townName) then
-		Notify:FireClient(player, ("Bridge is out. %s is blocked for now."):format(townName))
-		pushUI(player)
 		return
 	end
 
@@ -748,34 +729,16 @@ local function setPlayerSpeedMultiplier(player, multiplier, durationSeconds)
 	end)
 end
 
-local function getRandomActiveTown(pdata)
-	local contracts = pdata.ActiveContracts or {}
-	if #contracts == 0 then
-		return nil
-	end
-	local contract = contracts[math.random(1, #contracts)]
-	return contract.Town
-end
-
-local function clearExpiredBlocks(pdata)
-	for townName, blockedUntil in pairs(pdata.BlockedTowns or {}) do
-		if os.clock() >= blockedUntil then
-			pdata.BlockedTowns[townName] = nil
-		end
-	end
-end
-
 local function applyRandomEventToPlayer(player)
 	local pdata = getPlayerData(player)
 	if not pdata or #(pdata.ActiveContracts or {}) == 0 then
 		return
 	end
 
-	clearExpiredBlocks(pdata)
 	TownState.RefreshContractDeadlines(player, os.time())
 	local baseChance = tonumber(EVENTS_CFG.BaseChancePerTrip) or 0.35
 	local chance = baseChance * routeEventChanceMultiplier(pdata)
-	if pdata.Upgrades["Tier3Infrastructure.ReinforcedBridges"] or pdata.Upgrades.ReinforcedBridges then
+	if pdata.Upgrades["Tier3Infrastructure.RoadMaintenance"] or pdata.Upgrades.RoadMaintenance then
 		chance *= 0.8
 	end
 	chance = clamp(chance, 0.05, 0.95)
@@ -784,11 +747,6 @@ local function applyRandomEventToPlayer(player)
 	end
 
 	local eventName, eventData = weightedRandomEventType()
-	if eventName == "BrokenBridge" and (pdata.Upgrades["Tier3Infrastructure.ReinforcedBridges"] or pdata.Upgrades.ReinforcedBridges) then
-		if math.random() < 0.5 then
-			eventName, eventData = "DustStorm", (EVENTS_CFG.Types and EVENTS_CFG.Types.DustStorm) or {}
-		end
-	end
 	local eventLabel = eventData.DisplayName or eventName
 	pdata.CurrentPhase = "TravelDynamicEvents"
 	pdata.LastEventText = eventLabel
@@ -821,22 +779,6 @@ local function applyRandomEventToPlayer(player)
 		pdata.Money = pdata.Cash
 		Notify:FireClient(player, ("Bandits attacked: -$%d."):format(penalty))
 		pdata.ActiveEvents[eventName] = nil
-
-	elseif eventName == "BrokenBridge" then
-		local townName = getRandomActiveTown(pdata)
-		local blockDuration = tonumber(eventData.BlockDurationSeconds) or 45
-		if townName then
-			pdata.BlockedTowns[townName] = os.clock() + blockDuration
-			Notify:FireClient(player, ("Bridge failure near %s. Route blocked briefly."):format(townName))
-		end
-
-		task.delay(blockDuration, function()
-			local current = TownState.GetPlayerData(player)
-			if current then
-				current.ActiveEvents[eventName] = nil
-				pushUI(player)
-			end
-		end)
 	else
 		pdata.ActiveEvents[eventName] = nil
 	end
@@ -1062,7 +1004,6 @@ task.spawn(function()
 		for _, player in ipairs(Players:GetPlayers()) do
 			local pdata = TownState.GetPlayerData(player)
 			if pdata then
-				clearExpiredBlocks(pdata)
 				TownState.RefreshContractDeadlines(player, os.time())
 				expireLateContractsForPlayer(player)
 			end

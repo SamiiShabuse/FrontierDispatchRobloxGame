@@ -96,10 +96,10 @@ GameConfig.Towns = {
 			},
 			{
 				Id = "OldBridgeRoute",
-				DisplayName = "Old Bridge",
+				DisplayName = "Old Trail",
 				Risk = "High",
 				TravelTime = 0.75,
-				Notes = "Fastest path but fragile bridge.",
+				Notes = "Fastest path but rough terrain.",
 			},
 		},
 	},
@@ -150,16 +150,9 @@ GameConfig.DynamicEvents = {
 			DurationSeconds = 10,
 			Description = "Reduces movement speed during travel.",
 		},
-		BrokenBridge = {
-			DisplayName = "Broken Bridge",
-			ChanceWeight = 0.30,
-			BlockDurationSeconds = 45,
-			ForcedReroute = true,
-			Description = "Bridge collapses and forces reroute.",
-		},
 		Bandits = {
 			DisplayName = "Bandit Threat",
-			ChanceWeight = 0.30,
+			ChanceWeight = 0.60,
 			TimePenaltySeconds = 15,
 			PayoutLossPercent = 0.15,
 			Description = "Travel delay and possible payout loss.",
@@ -203,9 +196,9 @@ GameConfig.Upgrades = {
 			Cost = 320,
 			Effect = "Allows partial cargo transfer and time savings.",
 		},
-		ReinforcedBridges = {
+		RoadMaintenance = {
 			Cost = 260,
-			Effect = "Reduces broken bridge event chance.",
+			Effect = "Improves route reliability and lowers event pressure.",
 		},
 		RegionalDepots = {
 			Cost = 300,

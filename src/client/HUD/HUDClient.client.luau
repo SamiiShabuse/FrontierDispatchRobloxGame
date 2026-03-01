@@ -67,6 +67,10 @@ local completionAnimationId = 0
 local completionActive = false
 local hasSeenCashBaseline = false
 local lastKnownCash = 0
+local sectionRoot = nil
+local sectionPanels = {}
+local ensureCorner
+local ensureStroke
 
 local RESOURCE_ORDER = { "Food", "Medicine", "Tools", "Gold", "Water", "Payroll" }
 local PHASE_LABELS = {
@@ -77,19 +81,128 @@ local PHASE_LABELS = {
 	SystemEvolution = "System Evolution",
 }
 local THEME = {
-	MainBg = Color3.fromRGB(20, 27, 39),
-	MainBorder = Color3.fromRGB(62, 90, 130),
-	MainText = Color3.fromRGB(228, 235, 245),
-	Accent = Color3.fromRGB(116, 205, 255),
-	Dim = Color3.fromRGB(160, 176, 198),
-	ToastBg = Color3.fromRGB(29, 46, 66),
-	ToastText = Color3.fromRGB(240, 246, 255),
-	CompleteBg = Color3.fromRGB(25, 51, 40),
-	CompleteBorder = Color3.fromRGB(72, 209, 146),
-	CompleteText = Color3.fromRGB(231, 255, 245),
+	MainBg = Color3.fromRGB(58, 40, 27),
+	MainBorder = Color3.fromRGB(144, 105, 72),
+	MainText = Color3.fromRGB(246, 232, 209),
+	Accent = Color3.fromRGB(203, 165, 115),
+	Dim = Color3.fromRGB(206, 182, 153),
+	ToastBg = Color3.fromRGB(73, 52, 35),
+	ToastText = Color3.fromRGB(252, 238, 216),
+	CompleteBg = Color3.fromRGB(96, 66, 43),
+	CompleteBorder = Color3.fromRGB(214, 170, 111),
+	CompleteText = Color3.fromRGB(255, 243, 223),
+	PanelHeaderBg = Color3.fromRGB(94, 66, 44),
+	PanelHeaderText = Color3.fromRGB(252, 236, 210),
+	PanelBodyBg = Color3.fromRGB(63, 45, 31),
+	PanelBodyText = Color3.fromRGB(244, 229, 205),
 }
 
-local function ensureCorner(guiObject, radius)
+local function createSectionPanel(name, title, shortTitle, position, size)
+	local frame = Instance.new("Frame")
+	frame.Name = name
+	frame.AnchorPoint = Vector2.new(0, 0)
+	frame.Position = position
+	frame.Size = size
+	frame.BackgroundColor3 = THEME.PanelBodyBg
+	frame.BackgroundTransparency = 0.06
+	frame.BorderSizePixel = 0
+	frame.Parent = sectionRoot
+	ensureCorner(frame, 12)
+	ensureStroke(frame, THEME.MainBorder, 1.2)
+
+	local header = Instance.new("TextButton")
+	header.Name = "Header"
+	header.Size = UDim2.new(1, 0, 0, 30)
+	header.Position = UDim2.fromOffset(0, 0)
+	header.BackgroundColor3 = THEME.PanelHeaderBg
+	header.BackgroundTransparency = 0.02
+	header.TextColor3 = THEME.PanelHeaderText
+	header.Text = title .. "  [Hide]"
+	header.Font = Enum.Font.GothamBold
+	header.TextSize = 13
+	header.TextXAlignment = Enum.TextXAlignment.Left
+	header.AutoButtonColor = true
+	header.BorderSizePixel = 0
+	header.Parent = frame
+	ensureCorner(header, 10)
+
+	local content = Instance.new("TextLabel")
+	content.Name = "Content"
+	content.RichText = true
+	content.TextWrapped = true
+	content.TextXAlignment = Enum.TextXAlignment.Left
+	content.TextYAlignment = Enum.TextYAlignment.Top
+	content.Font = Enum.Font.Gotham
+	content.TextSize = 13
+	content.TextColor3 = THEME.PanelBodyText
+	content.BackgroundTransparency = 1
+	content.BorderSizePixel = 0
+	content.Position = UDim2.fromOffset(8, 36)
+	content.Size = UDim2.new(1, -16, 1, -44)
+	content.Text = ""
+	content.Parent = frame
+
+	local isCollapsed = false
+	local collapsedSize = UDim2.fromOffset(72, 72)
+
+	local function applyCollapsedLayout(collapsed)
+		if collapsed then
+			frame.Size = collapsedSize
+			header.Size = UDim2.new(1, 0, 1, 0)
+			header.TextXAlignment = Enum.TextXAlignment.Center
+			header.TextYAlignment = Enum.TextYAlignment.Center
+			header.TextSize = 12
+			header.Text = shortTitle
+			content.Visible = false
+		else
+			frame.Size = size
+			header.Size = UDim2.new(1, 0, 0, 30)
+			header.TextXAlignment = Enum.TextXAlignment.Left
+			header.TextYAlignment = Enum.TextYAlignment.Center
+			header.TextSize = 13
+			header.Text = title .. "  [Hide]"
+			content.Visible = true
+		end
+	end
+
+	header.MouseButton1Click:Connect(function()
+		isCollapsed = not isCollapsed
+		applyCollapsedLayout(isCollapsed)
+	end)
+
+	applyCollapsedLayout(false)
+
+	return {
+		Frame = frame,
+		Header = header,
+		Content = content,
+		ExpandedSize = size,
+		Title = title,
+	}
+end
+
+local function ensureSectionHUD()
+	if sectionRoot and sectionRoot.Parent then
+		return
+	end
+
+	sectionRoot = Instance.new("Frame")
+	sectionRoot.Name = "SectionHUDRoot"
+	sectionRoot.BackgroundTransparency = 1
+	sectionRoot.Size = UDim2.fromScale(1, 1)
+	sectionRoot.Position = UDim2.fromOffset(0, 0)
+	sectionRoot.Parent = screenGui
+
+	sectionPanels = {
+		Status = createSectionPanel("StatusPanel", "Dispatch Status", "STS", UDim2.fromScale(0.74, 0.02), UDim2.fromScale(0.24, 0.13)),
+		Available = createSectionPanel("AvailablePanel", "Available Contracts", "AVL", UDim2.fromScale(0.02, 0.17), UDim2.fromScale(0.32, 0.34)),
+		Events = createSectionPanel("EventsPanel", "Live Events", "EVT", UDim2.fromScale(0.02, 0.53), UDim2.fromScale(0.32, 0.28)),
+		Active = createSectionPanel("ActivePanel", "Active Deliveries", "ACT", UDim2.fromScale(0.74, 0.17), UDim2.fromScale(0.24, 0.28)),
+		Towns = createSectionPanel("TownsPanel", "Town Systems", "TWN", UDim2.fromScale(0.74, 0.47), UDim2.fromScale(0.24, 0.34)),
+	}
+end
+
+ensureCorner = function(guiObject, radius)
 	if guiObject:FindFirstChild("HUDCorner") then
 		return
 	end
@@ -99,7 +212,7 @@ local function ensureCorner(guiObject, radius)
 	corner.Parent = guiObject
 end
 
-local function ensureStroke(guiObject, color, thickness)
+ensureStroke = function(guiObject, color, thickness)
 	local stroke = guiObject:FindFirstChild("HUDStroke")
 	if not stroke then
 		stroke = Instance.new("UIStroke")
@@ -134,6 +247,8 @@ local function applyHUDStyling()
 		styleTextObject(toastLabel, true)
 		toastLabel.Visible = false
 	end
+	ensureSectionHUD()
+	mainLabel.Visible = false
 end
 
 local function ensureCompletionCard()
@@ -166,6 +281,9 @@ local function ensureCompletionCard()
 end
 
 local function shouldHideMainHUD(payload)
+	if sectionRoot and sectionRoot.Parent then
+		return true
+	end
 	if completionActive then
 		return true
 	end
@@ -181,6 +299,9 @@ end
 
 local function setMainHUDVisibility(payload)
 	mainLabel.Visible = not shouldHideMainHUD(payload)
+	if sectionRoot and sectionRoot.Parent then
+		sectionRoot.Visible = not completionActive
+	end
 end
 
 local function animateCompletionPayout(previousCash, newCash)
@@ -191,6 +312,9 @@ local function animateCompletionPayout(previousCash, newCash)
 
 	completionActive = true
 	mainLabel.Visible = false
+	if sectionRoot and sectionRoot.Parent then
+		sectionRoot.Visible = false
+	end
 	card.Visible = true
 
 	card.Text = string.format(
@@ -391,7 +515,7 @@ local function formatEvents(payload)
 	return "<font color=\"#74CDFF\"><b>LIVE EVENTS</b></font>\n" .. table.concat(lines, "\n")
 end
 
-local function formatUpgrades(payload)
+local function _formatUpgrades(payload)
 	local p = payload.player or {}
 	local upgrades = p.upgrades or {}
 	local lines = {}
@@ -458,7 +582,7 @@ local function formatMVPStatus(payload)
 	)
 end
 
-local function formatPlayerSection(payload)
+local function _formatPlayerSection(payload)
 	local p = payload.player or {}
 	local minCarry, maxCarry = getCarryLimits(payload)
 	local available = formatContracts(payload.contracts, minCarry, maxCarry)
@@ -488,6 +612,50 @@ local function formatPlayerSection(payload)
 		.. active
 end
 
+local function formatPlayerSummary(payload)
+	local p = payload.player or {}
+	local minCarry, maxCarry = getCarryLimits(payload)
+	local routeLine = "Route: (none)"
+	if p.route then
+		routeLine = "Route: " .. tostring(p.route.displayName or p.route.routeId or "selected")
+	end
+	local priorityLine = "Priority: (none)"
+	if p.priority and (hasUpgrade(payload, "Tier2Automation", "PriorityDispatch") or p.hasTelegraph) then
+		priorityLine = tostring(p.priority.resource) .. " -> " .. tostring(p.priority.town)
+	end
+	local depot = (p.readyForDepot and "YES") or "NO"
+	return string.format(
+		"Score: %s\nCash: $%s\nCargo: %d-%d\nTelegraph: %s\n%s\nPriority: %s\nReady for depot: %s",
+		tostring(p.score or 0),
+		tostring(p.cash or p.money or 0),
+		minCarry,
+		maxCarry,
+		((p.hasTelegraph and "ONLINE") or "OFFLINE"),
+		routeLine,
+		priorityLine,
+		depot
+	)
+end
+
+local function updateSectionPanels(payload)
+	if not (sectionRoot and sectionRoot.Parent) then
+		return
+	end
+
+	local minCarry, maxCarry = getCarryLimits(payload)
+	local availableText = formatContracts(payload.contracts, minCarry, maxCarry)
+	local activeText = formatActiveContracts(payload.activeContracts)
+	local townsText = formatTowns(payload)
+	local statusText = formatPhase(payload) .. "\n\n" .. formatPlayerSummary(payload)
+	local eventsText = formatEvents(payload) .. "\n\n" .. formatMVPStatus(payload)
+
+	sectionPanels.Status.Content.Text = statusText
+	sectionPanels.Available.Content.Text = availableText
+	sectionPanels.Active.Content.Text = activeText
+	sectionPanels.Towns.Content.Text = townsText
+	sectionPanels.Events.Content.Text = eventsText
+end
+
 local function render(payload)
 	if payload then
 		lastPayload = payload
@@ -505,15 +673,7 @@ local function render(payload)
 	lastKnownCash = currentCash
 	hasSeenCashBaseline = true
 
-	local sections = {
-		formatPhase(lastPayload),
-		formatEvents(lastPayload),
-		formatPlayerSection(lastPayload),
-		formatTowns(lastPayload),
-		formatMVPStatus(lastPayload),
-	}
-
-	mainLabel.Text = table.concat(sections, "\n\n")
+	updateSectionPanels(lastPayload)
 	setMainHUDVisibility(lastPayload)
 end
 

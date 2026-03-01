@@ -25,7 +25,6 @@ function TownState.InitPlayer(player)
 		AvailableContracts = {},
 		ActiveContracts = {},
 		ActiveEvent = nil, -- string or table
-		BlockedTowns = {}, -- [towname] = unblockedTime
 		Day = 1,
 		CurrentPhase = "MorningDispatch",
 		Upgrades = {},
