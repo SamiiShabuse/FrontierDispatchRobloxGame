@@ -112,7 +112,10 @@ GameConfig.Contracts = {
 	CarryLimitMax = 3,
 	DeadlineHoursMin = 8,
 	DeadlineHoursMax = 20,
+	ContractHourSeconds = 12, -- gameplay time scale for MVP
 	UrgencyLevels = { "Low", "Medium", "High", "Critical" },
+	LatePayoutMultiplier = 0.6,
+	LateScorePenaltyPerContract = 1,
 	Payout = {
 		Min = 40,
 		Max = 140,
@@ -216,6 +219,11 @@ GameConfig.Progression = {
 	PopulationGrowthOnSuccess = 1,
 	DemandGrowthPerPopulationStep = 0.2,
 	RoadStrainGrowthPerDay = 0.03,
+}
+
+GameConfig.Depot = {
+	Names = { "Depot", "DispatchDepot" },
+	DropZoneNames = { "DropZone", "DepotDropZone", "DispatchZone" },
 }
 
 return GameConfig

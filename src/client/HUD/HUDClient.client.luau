@@ -10,6 +10,9 @@ local Remotes = ReplicatedStorage:WaitForChild("Remotes")
 local UpdateUI = Remotes:WaitForChild("UpdateUI")
 local Notify = Remotes:WaitForChild("Notify")
 local PickContracts = Remotes:WaitForChild("PickContracts")
+local SelectRoute = Remotes:WaitForChild("SelectRoute")
+local BuyUpgrade = Remotes:WaitForChild("BuyUpgrade")
+local RequestContracts = Remotes:WaitForChild("RequestContracts")
 
 local function getFallbackConfig()
 	return {
@@ -59,6 +62,11 @@ end
 local lastPayload = nil
 local notifyQueue = {}
 local showingToast = false
+local completionCard = nil
+local completionAnimationId = 0
+local completionActive = false
+local hasSeenCashBaseline = false
+local lastKnownCash = 0
 
 local RESOURCE_ORDER = { "Food", "Medicine", "Tools", "Gold", "Water", "Payroll" }
 local PHASE_LABELS = {
@@ -76,6 +84,9 @@ local THEME = {
 	Dim = Color3.fromRGB(160, 176, 198),
 	ToastBg = Color3.fromRGB(29, 46, 66),
 	ToastText = Color3.fromRGB(240, 246, 255),
+	CompleteBg = Color3.fromRGB(25, 51, 40),
+	CompleteBorder = Color3.fromRGB(72, 209, 146),
+	CompleteText = Color3.fromRGB(231, 255, 245),
 }
 
 local function ensureCorner(guiObject, radius)
@@ -125,12 +136,118 @@ local function applyHUDStyling()
 	end
 end
 
+local function ensureCompletionCard()
+	if completionCard and completionCard.Parent then
+		return completionCard
+	end
+
+	completionCard = Instance.new("TextLabel")
+	completionCard.Name = "CompletionCard"
+	completionCard.AnchorPoint = Vector2.new(0.5, 0.5)
+	completionCard.Position = UDim2.fromScale(0.5, 0.3)
+	completionCard.Size = UDim2.fromScale(0.5, 0.2)
+	completionCard.BackgroundColor3 = THEME.CompleteBg
+	completionCard.BackgroundTransparency = 0.08
+	completionCard.TextColor3 = THEME.CompleteText
+	completionCard.TextWrapped = true
+	completionCard.TextXAlignment = Enum.TextXAlignment.Center
+	completionCard.TextYAlignment = Enum.TextYAlignment.Center
+	completionCard.Font = Enum.Font.GothamBold
+	completionCard.TextSize = 22
+	completionCard.RichText = true
+	completionCard.BorderSizePixel = 0
+	completionCard.Visible = false
+	completionCard.ZIndex = 20
+	completionCard.Parent = screenGui
+	ensureCorner(completionCard, 14)
+	ensureStroke(completionCard, THEME.CompleteBorder, 2)
+
+	return completionCard
+end
+
+local function shouldHideMainHUD(payload)
+	if completionActive then
+		return true
+	end
+
+	local phase = tostring(payload.phase or payload.currentPhase or "")
+	local activeContracts = payload.activeContracts or {}
+	if (phase == "RouteStrategy" or phase == "TravelDynamicEvents") and #activeContracts > 0 then
+		return true
+	end
+
+	return false
+end
+
+local function setMainHUDVisibility(payload)
+	mainLabel.Visible = not shouldHideMainHUD(payload)
+end
+
+local function animateCompletionPayout(previousCash, newCash)
+	local card = ensureCompletionCard()
+	completionAnimationId += 1
+	local animationId = completionAnimationId
+	local gain = math.max(0, newCash - previousCash)
+
+	completionActive = true
+	mainLabel.Visible = false
+	card.Visible = true
+
+	card.Text = string.format(
+		"<b>CONTRACT COMPLETE</b>\nCongratulations! Great delivery.\n$%d -> $%d",
+		previousCash,
+		previousCash
+	)
+
+	local duration = 1.2
+	local steps = 24
+	for i = 1, steps do
+		if animationId ~= completionAnimationId then
+			return
+		end
+		local alpha = i / steps
+		local current = previousCash + math.floor(gain * alpha)
+		card.Text = string.format(
+			"<b>CONTRACT COMPLETE</b>\nCongratulations! Great delivery.\nCash: $%d <font color=\"#80FFB8\">(+%d)</font>",
+			current,
+			current - previousCash
+		)
+		task.wait(duration / steps)
+	end
+
+	if animationId ~= completionAnimationId then
+		return
+	end
+
+	task.wait(1.4)
+	if animationId ~= completionAnimationId then
+		return
+	end
+
+	card.Visible = false
+	completionActive = false
+	if lastPayload then
+		setMainHUDVisibility(lastPayload)
+	end
+end
+
 local function getCarryLimits(payload)
 	local cfg = GameConfig.Contracts or {}
 	local p = payload.player or {}
 	local maxCarry = tonumber(p.carryLimit) or cfg.CarryLimitMax or 2
 	local minCarry = tonumber(p.minCarryLimit) or cfg.CarryLimitMin or 2
 	return minCarry, maxCarry
+end
+
+local function hasUpgrade(payload, tierName, upgradeName)
+	local upgrades = (payload.player and payload.player.upgrades) or {}
+	if upgrades[upgradeName] == true then
+		return true
+	end
+	if tierName and upgrades[tierName .. "." .. upgradeName] == true then
+		return true
+	end
+	return false
 end
 
 local function formatTownDemand(demand)
@@ -147,7 +264,17 @@ local function formatTownDemand(demand)
 	return table.concat(parts, " ")
 end
 
-local function formatTowns(towns)
+local function formatDuration(totalSeconds)
+	local seconds = math.max(0, tonumber(totalSeconds) or 0)
+	local minutes = math.floor(seconds / 60)
+	local remain = seconds % 60
+	return string.format("%02d:%02d", minutes, remain)
+end
+
+local function formatTowns(payload)
+	local towns = payload.towns or {}
+	local showDemand = hasUpgrade(payload, "Tier1Visibility", "DemandBoard")
+	local showSatisfaction = hasUpgrade(payload, "Tier1Visibility", "SatisfactionMeter")
 	local names = {}
 	for townName, _ in pairs(towns) do
 		table.insert(names, townName)
@@ -162,24 +289,34 @@ local function formatTowns(towns)
 	for _, townName in ipairs(names) do
 		local t = towns[townName] or {}
 		local d = t.Demand or {}
-		local stability = t.Stability or t.stability or "?"
-		local trust = t.Trust or t.trust or "?"
+		local stability = tonumber(t.Stability or t.stability or 0) or 0
+		local trust = tonumber(t.Trust or t.trust or 0) or 0
 		local population = t.Population or t.population or "?"
+		local info = {}
+
+		if showSatisfaction then
+			local stabilityBar = string.rep("|", math.max(1, math.floor(stability / 10)))
+			local trustBar = string.rep("|", math.max(1, math.floor(trust / 10)))
+			table.insert(info, string.format("S:%d %s", stability, stabilityBar))
+			table.insert(info, string.format("T:%d %s", trust, trustBar))
+		else
+			table.insert(info, "S/T: unlock SatisfactionMeter")
+		end
+
+		table.insert(info, "P:" .. tostring(population))
 
 		table.insert(
 			lines,
 			string.format(
-				"%s | S:%s T:%s P:%s | %s",
+				"%s | %s | %s",
 				townName,
-				tostring(stability),
-				tostring(trust),
-				tostring(population),
-				formatTownDemand(d)
+				table.concat(info, " "),
+				showDemand and formatTownDemand(d) or "Demand: unlock DemandBoard"
 			)
 		)
 	end
 
-	return "=== TOWNS ===\n" .. table.concat(lines, "\n")
+	return "<font color=\"#74CDFF\"><b>TOWNS</b></font>\n" .. table.concat(lines, "\n")
 end
 
 local function formatContracts(list, minCarry, maxCarry)
@@ -190,16 +327,18 @@ local function formatContracts(list, minCarry, maxCarry)
 	local lines = {}
 	for i, c in ipairs(list) do
 		local deadline = c.Deadline or c.deadlineHours or "?"
+		local eta = c.DueAt and (" ETA:" .. formatDuration((tonumber(c.DueAt) or 0) - os.time())) or ""
 		table.insert(
 			lines,
 			string.format(
-				"%d) %s -> %s | $%d | U%s | DL:%sh",
+				"%d) %s -> %s | $%d | U%s | DL:%sh%s",
 				i,
 				tostring(c.Resource or c.resource or "?"),
 				tostring(c.Town or c.town or "?"),
 				tonumber(c.Payout or c.payout) or 0,
 				tostring(c.Urgency or c.urgency or 1),
-				tostring(deadline)
+				tostring(deadline),
+				eta
 			)
 		)
 	end
@@ -218,14 +357,16 @@ local function formatActiveContracts(list)
 	local lines = {}
 	for i, c in ipairs(list) do
 		local status = c.Status or c.status or "Active"
+		local eta = c.DueAt and (" | ETA:" .. formatDuration((tonumber(c.DueAt) or 0) - os.time())) or ""
 		table.insert(
 			lines,
 			string.format(
-				"%d) %s -> %s | %s",
+				"%d) %s -> %s | %s%s",
 				i,
 				tostring(c.Resource or c.resource or "?"),
 				tostring(c.Town or c.town or "?"),
-				tostring(status)
+				tostring(status),
+				eta
 			)
 		)
 	end
@@ -283,13 +424,21 @@ local function formatPhase(payload)
 	local objective = payload.objective or "Pick contracts at the depot."
 	local displayPhase = PHASE_LABELS[tostring(phase)] or tostring(phase)
 	local routeHint = "Phase flow: " .. table.concat(GameConfig.LoopPhases or {}, " -> ")
+	local routeSelectHint = ""
+	if payload.phase == "RouteStrategy" and type(payload.routeOptions) == "table" and #payload.routeOptions > 0 then
+		local first = payload.routeOptions[1]
+		if first and first.Id and payload.routeTown then
+			routeSelectHint = string.format("\n<font color=\"#A0B0C6\">Pick route: /route %s %s</font>", tostring(payload.routeTown), tostring(first.Id))
+		end
+	end
 
 	return string.format(
-		"<font color=\"#74CDFF\"><b>FRONTIER DISPATCH</b></font>\nDay %s  |  %s\n<font color=\"#A0B0C6\">%s</font>\n<font color=\"#A0B0C6\">%s</font>",
+		"<font color=\"#74CDFF\"><b>FRONTIER DISPATCH</b></font>\nDay %s  |  %s\n<font color=\"#A0B0C6\">%s</font>\n<font color=\"#A0B0C6\">%s</font>%s",
 		tostring(day),
 		tostring(displayPhase),
 		tostring(objective),
-		routeHint
+		routeHint,
+		routeSelectHint
 	)
 end
 
@@ -316,15 +465,22 @@ local function formatPlayerSection(payload)
 	local active = formatActiveContracts(payload.activeContracts)
 
 	local priorityLine = "Priority: (none)"
-	if p.priority then
+	if p.priority and (hasUpgrade(payload, "Tier2Automation", "PriorityDispatch") or p.hasTelegraph) then
 		priorityLine = "Priority: " .. tostring(p.priority.resource) .. " -> " .. tostring(p.priority.town)
 	end
+	local routeLine = "Route: (not selected)"
+	if p.route then
+		routeLine = "Route: " .. tostring(p.route.displayName or p.route.routeId or "selected")
+	end
+	local depotLine = (p.readyForDepot and "Depot: return now for next day") or "Depot: active run"
 
 	return "<font color=\"#74CDFF\"><b>DISPATCHER</b></font>\n"
 		.. "Score: " .. tostring(p.score or 0) .. "\n"
 		.. "Cash: $" .. tostring(p.cash or p.money or 0) .. "\n"
 		.. "Telegraph: " .. ((p.hasTelegraph and "ONLINE") or "OFFLINE") .. "\n"
 		.. "Cargo slots: " .. tostring(minCarry) .. "-" .. tostring(maxCarry) .. "\n"
+		.. routeLine .. "\n"
+		.. depotLine .. "\n"
 		.. priorityLine
 		.. "\n\n<font color=\"#74CDFF\"><b>AVAILABLE CONTRACTS</b></font>\n"
 		.. available
@@ -340,16 +496,25 @@ local function render(payload)
 		return
 	end
 
+	local playerData = lastPayload.player or {}
+	local currentCash = tonumber(playerData.cash or playerData.money or 0) or 0
+	local phase = tostring(lastPayload.phase or lastPayload.currentPhase or "")
+	if hasSeenCashBaseline and currentCash > lastKnownCash and (phase == "DeliveryOutcome" or phase == "SystemEvolution") then
+		task.spawn(animateCompletionPayout, lastKnownCash, currentCash)
+	end
+	lastKnownCash = currentCash
+	hasSeenCashBaseline = true
+
 	local sections = {
 		formatPhase(lastPayload),
 		formatEvents(lastPayload),
 		formatPlayerSection(lastPayload),
-		formatUpgrades(lastPayload),
-		formatTowns(lastPayload.towns or {}),
+		formatTowns(lastPayload),
 		formatMVPStatus(lastPayload),
 	}
 
 	mainLabel.Text = table.concat(sections, "\n\n")
+	setMainHUDVisibility(lastPayload)
 end
 
 local function showToast(message)
@@ -398,6 +563,34 @@ end)
 
 player.Chatted:Connect(function(msg)
 	local lowered = string.lower(msg)
+	if string.sub(lowered, 1, 6) == "/route" then
+		local town, routeId = msg:match("^/route%s+([%w_]+)%s+([%w_]+)")
+		if not town or not routeId then
+			showToast("Usage: /route TownName RouteId")
+			return
+		end
+		SelectRoute:FireServer({ town = town, routeId = routeId })
+		showToast("Route request sent.")
+		return
+	end
+
+	if string.sub(lowered, 1, 8) == "/upgrade" then
+		local tier, upgrade = msg:match("^/upgrade%s+([%w_]+)%s+([%w_]+)")
+		if not tier or not upgrade then
+			showToast("Usage: /upgrade TierName UpgradeName")
+			return
+		end
+		BuyUpgrade:FireServer({ tier = tier, upgrade = upgrade })
+		showToast("Upgrade purchase request sent.")
+		return
+	end
+
+	if lowered == "/contracts" or lowered == "/dispatch" then
+		RequestContracts:FireServer()
+		showToast("Requested contracts from server.")
+		return
+	end
+
 	if string.sub(lowered, 1, 5) ~= "/pick" then
 		return
 	end

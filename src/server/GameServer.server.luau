@@ -1,6 +1,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
+local DataStoreService = game:GetService("DataStoreService")
 
 local function getModule(moduleName)
 	local shared = ReplicatedStorage:FindFirstChild("Shared") or ReplicatedStorage:WaitForChild("Shared", 5)
@@ -62,6 +63,13 @@ local BASE_DEMAND_INCREASE = TOWN_SYSTEMS_CFG.BaseDemandIncreasePerTick or 1
 local CARRY_MIN = CONTRACTS_CFG.CarryLimitMin or 2
 local CARRY_MAX = CONTRACTS_CFG.CarryLimitMax or 3
 local UPGRADE_TELEGRAPH_COST = (((GameConfig.Upgrades or {}).Tier1Visibility or {}).DemandBoard or {}).Cost or 100
+local DEADLINE_HOUR_SECONDS = CONTRACTS_CFG.ContractHourSeconds or 12
+local LATE_PAYOUT_MULTIPLIER = CONTRACTS_CFG.LatePayoutMultiplier or 0.6
+local LATE_SCORE_PENALTY = CONTRACTS_CFG.LateScorePenaltyPerContract or 1
+local OUTCOME_IMPACT = CONTRACTS_CFG.OutcomeImpact or {}
+local ON_TIME_IMPACT = OUTCOME_IMPACT.OnTime or {}
+local LATE_IMPACT = OUTCOME_IMPACT.Late or {}
+local PLAYER_DATASTORE = DataStoreService:GetDataStore("FrontierDispatch_PlayerData_v1")
 
 local function getTownFolder()
 	local fromMap = Workspace:FindFirstChild("Map")
@@ -128,6 +136,37 @@ local function getPlayerData(player)
 	data.Cash = data.Cash or data.Money or 0
 
 	return data
+end
+
+local function datastoreKey(player)
+	return "player:" .. tostring(player.UserId)
+end
+
+local function loadPlayerProgress(player)
+	local ok, result = pcall(function()
+		return PLAYER_DATASTORE:GetAsync(datastoreKey(player))
+	end)
+	if not ok then
+		warn(("[GameServer] Load failed for %s: %s"):format(player.Name, tostring(result)))
+		return
+	end
+	if type(result) ~= "table" then
+		return
+	end
+	TownState.ApplyLoadedPlayerData(player, result)
+end
+
+local function savePlayerProgress(player)
+	local payload = TownState.ExportPlayerSaveData(player)
+	if not payload then
+		return
+	end
+	local ok, err = pcall(function()
+		PLAYER_DATASTORE:SetAsync(datastoreKey(player), payload)
+	end)
+	if not ok then
+		warn(("[GameServer] Save failed for %s: %s"):format(player.Name, tostring(err)))
+	end
 end
 
 local function weightedRandomEventType()
@@ -231,6 +270,34 @@ local function routeRiskMultiplier(townName)
 	return 1.1
 end
 
+local function routePayoutMultiplier(pdata)
+	local route = pdata.SelectedRoute
+	if not route then
+		return 1.0
+	end
+	local risk = tostring(route.risk or "Medium")
+	if risk == "High" then
+		return 1.15
+	elseif risk == "Low" then
+		return 1.0
+	end
+	return 1.08
+end
+
+local function routeEventChanceMultiplier(pdata)
+	local route = pdata.SelectedRoute
+	if not route then
+		return 1.0
+	end
+	local risk = tostring(route.risk or "Medium")
+	if risk == "High" then
+		return 1.4
+	elseif risk == "Low" then
+		return 0.75
+	end
+	return 1.0
+end
+
 local function generateContractsForPlayer(player)
 	local pdata = getPlayerData(player)
 	if not pdata then
@@ -269,6 +336,46 @@ local function generateContractsForPlayer(player)
 	Notify:FireClient(player, "Pick contracts at the depot. Use /pick 1 2")
 end
 
+local function stampPickedContracts(pickedContracts, selectedRoute)
+	local now = os.time()
+	local risk = selectedRoute and tostring(selectedRoute.risk or "Medium") or "Medium"
+	local routeTimeMultiplier = 1.0
+	if risk == "High" then
+		routeTimeMultiplier = 0.85
+	elseif risk == "Low" then
+		routeTimeMultiplier = 1.10
+	end
+
+	for _, contract in ipairs(pickedContracts) do
+		local hours = tonumber(contract.Deadline) or (CONTRACTS_CFG.DeadlineHoursMin or 8)
+		local seconds = math.floor(hours * DEADLINE_HOUR_SECONDS * routeTimeMultiplier)
+		contract.AcceptedAt = now
+		contract.DueAt = now + math.max(30, seconds)
+		contract.IsLate = false
+		contract.Status = "Active"
+	end
+end
+
+local function expireLateContractsForPlayer(player)
+	local pdata = getPlayerData(player)
+	if not pdata then
+		return
+	end
+
+	local expired = TownState.ExpireLateContracts(player, os.time(), LATE_IMPACT, 5)
+	if #expired == 0 then
+		return
+	end
+
+	pdata.CurrentPhase = "TravelDynamicEvents"
+	Notify:FireClient(player, string.format("%d contract(s) failed due to deadlines.", #expired))
+	if #pdata.ActiveContracts == 0 then
+		pdata.ReadyForDepot = true
+		pdata.CurrentPhase = "SystemEvolution"
+		Notify:FireClient(player, "Return to depot for next dispatch day.")
+	end
+end
+
 local function getPriorityForPlayer(pdata)
 	local townName, resourceName = getHighestDemand()
 	if not pdata.HasTelegraph or not townName or not resourceName then
@@ -298,6 +405,8 @@ local function buildPayloadFor(player)
 			payload.objective = "Stay on route and react to events."
 		elseif payload.phase == "DeliveryOutcome" then
 			payload.objective = "Delivery complete. Return to depot for next dispatch."
+		elseif payload.phase == "SystemEvolution" then
+			payload.objective = "Return to depot to start next day and plan upgrades."
 		end
 
 		payload.player = payload.player or {}
@@ -309,7 +418,21 @@ local function buildPayloadFor(player)
 		payload.player.minCarryLimit = CARRY_MIN
 		payload.player.upgrades = pdata.Upgrades or {}
 		payload.player.route = pdata.SelectedRoute
+		payload.player.readyForDepot = pdata.ReadyForDepot == true
 		payload.blockedTowns = pdata.BlockedTowns or {}
+		payload.routeOptions = {}
+
+		local routeTown = pdata.SelectedRoute and pdata.SelectedRoute.town
+		if not routeTown then
+			local firstContract = (pdata.ActiveContracts and pdata.ActiveContracts[1]) or (pdata.AvailableContracts and pdata.AvailableContracts[1])
+			if firstContract then
+				routeTown = firstContract.Town
+			end
+		end
+		if routeTown and GameConfig.Towns and GameConfig.Towns[routeTown] then
+			payload.routeOptions = GameConfig.Towns[routeTown].RouteOptions or {}
+			payload.routeTown = routeTown
+		end
 
 		for eventName, _ in pairs(pdata.ActiveEvents or {}) do
 			table.insert(payload.events, eventName)
@@ -430,7 +553,15 @@ local function onDropZoneTouched(townName, hit)
 		return
 	end
 
-	local ok, message, delivered = TownState.DeliverAtTown(player, townName)
+	local ok, message, delivered = TownState.DeliverAtTown(player, townName, {
+		Now = os.time(),
+		DemandReduction = TOWN_SYSTEMS_CFG.DeliveryDemandReduction or 8,
+		OnTimeImpact = ON_TIME_IMPACT,
+		LateImpact = LATE_IMPACT,
+		LatePayoutMultiplier = LATE_PAYOUT_MULTIPLIER,
+		LateScorePenaltyPerContract = LATE_SCORE_PENALTY,
+		RouteBonusMultiplier = routePayoutMultiplier(pdata),
+	})
 	Notify:FireClient(player, message)
 
 	if ok then
@@ -438,9 +569,9 @@ local function onDropZoneTouched(townName, hit)
 		unlockTelegraphIfEarned(player, pdata)
 
 		if #delivered > 0 and #pdata.ActiveContracts == 0 then
-			pdata.Day += 1
-			generateContractsForPlayer(player)
-			Notify:FireClient(player, "All deliveries complete. New contracts are now available.")
+			pdata.ReadyForDepot = true
+			pdata.CurrentPhase = "SystemEvolution"
+			Notify:FireClient(player, "All deliveries complete. Return to depot to start next day.")
 		else
 			pdata.CurrentPhase = "TravelDynamicEvents"
 		end
@@ -465,6 +596,85 @@ local function bindTownDropZone(townModel)
 	dropZone.Touched:Connect(function(hit)
 		onDropZoneTouched(townName, hit)
 	end)
+end
+
+local function matchesAnyName(instanceName, allowedNames)
+	for _, name in ipairs(allowedNames or {}) do
+		if instanceName == name then
+			return true
+		end
+	end
+	return false
+end
+
+local function findDepotDropZones()
+	local results = {}
+	local depotCfg = GameConfig.Depot or {}
+	local depotNames = depotCfg.Names or { "Depot" }
+	local dropZoneNames = depotCfg.DropZoneNames or { "DropZone", "DepotDropZone" }
+
+	local function collectFromContainer(container)
+		if not container then
+			return
+		end
+		for _, child in ipairs(container:GetDescendants()) do
+			if child:IsA("BasePart") and matchesAnyName(child.Name, dropZoneNames) then
+				local ancestor = child.Parent
+				while ancestor and ancestor ~= Workspace do
+					if matchesAnyName(ancestor.Name, depotNames) then
+						table.insert(results, child)
+						break
+					end
+					ancestor = ancestor.Parent
+				end
+			end
+		end
+	end
+
+	collectFromContainer(Workspace)
+	return results
+end
+
+local boundDepotZones = {}
+
+local function bindDepotDropZones()
+	for _, zone in ipairs(findDepotDropZones()) do
+		if not boundDepotZones[zone] then
+			boundDepotZones[zone] = true
+			zone.Touched:Connect(function(hit)
+				local player = playerFromHit(hit)
+				if not player then
+					return
+				end
+				if not touchAllowed(player, "DEPOT") then
+					return
+				end
+
+				local pdata = getPlayerData(player)
+				if not pdata then
+					return
+				end
+
+				if #(pdata.ActiveContracts or {}) > 0 then
+					Notify:FireClient(player, "Finish active contracts before ending the day.")
+					return
+				end
+
+				if not pdata.ReadyForDepot and #(pdata.AvailableContracts or {}) > 0 then
+					Notify:FireClient(player, "Choose contracts first.")
+					pushUI(player)
+					return
+				end
+
+				pdata.Day += 1
+				pdata.ReadyForDepot = false
+				pdata.CurrentPhase = "MorningDispatch"
+				generateContractsForPlayer(player)
+				Notify:FireClient(player, string.format("Day %d begins. New contracts posted.", pdata.Day))
+				pushUI(player)
+			end)
+		end
+	end
 end
 
 local function ensureTownInitialized(townName)
@@ -508,6 +718,13 @@ local function initializeTowns()
 			ensureTownInitialized(child.Name)
 			bindTownDropZone(child)
 			broadcast()
+		end
+	end)
+
+	bindDepotDropZones()
+	Workspace.DescendantAdded:Connect(function(descendant)
+		if descendant:IsA("BasePart") then
+			task.defer(bindDepotDropZones)
 		end
 	end)
 end
@@ -555,7 +772,23 @@ local function applyRandomEventToPlayer(player)
 	end
 
 	clearExpiredBlocks(pdata)
+	TownState.RefreshContractDeadlines(player, os.time())
+	local baseChance = tonumber(EVENTS_CFG.BaseChancePerTrip) or 0.35
+	local chance = baseChance * routeEventChanceMultiplier(pdata)
+	if pdata.Upgrades["Tier3Infrastructure.ReinforcedBridges"] or pdata.Upgrades.ReinforcedBridges then
+		chance *= 0.8
+	end
+	chance = clamp(chance, 0.05, 0.95)
+	if math.random() > chance then
+		return
+	end
+
 	local eventName, eventData = weightedRandomEventType()
+	if eventName == "BrokenBridge" and (pdata.Upgrades["Tier3Infrastructure.ReinforcedBridges"] or pdata.Upgrades.ReinforcedBridges) then
+		if math.random() < 0.5 then
+			eventName, eventData = "DustStorm", (EVENTS_CFG.Types and EVENTS_CFG.Types.DustStorm) or {}
+		end
+	end
 	local eventLabel = eventData.DisplayName or eventName
 	pdata.CurrentPhase = "TravelDynamicEvents"
 	pdata.LastEventText = eventLabel
@@ -627,6 +860,7 @@ PickContracts.OnServerEvent:Connect(function(player, pickedContracts)
 		return
 	end
 
+	stampPickedContracts(pdata.ActiveContracts, pdata.SelectedRoute)
 	pdata.CurrentPhase = "RouteStrategy"
 	Notify:FireClient(player, message)
 	Notify:FireClient(player, "Contracts locked. Choose a route and start driving.")
@@ -650,6 +884,18 @@ SelectRoute.OnServerEvent:Connect(function(player, payload)
 	end
 
 	local townConfig = (GameConfig.Towns or {})[townName]
+	local hasContractForTown = false
+	for _, contract in ipairs(pdata.ActiveContracts or {}) do
+		if contract.Town == townName then
+			hasContractForTown = true
+			break
+		end
+	end
+	if not hasContractForTown and #(pdata.ActiveContracts or {}) > 0 then
+		Notify:FireClient(player, "Route must match one of your active contract towns.")
+		return
+	end
+
 	local selectedRoute = nil
 	for _, route in ipairs((townConfig and townConfig.RouteOptions) or {}) do
 		if route.Id == routeId then
@@ -669,8 +915,23 @@ SelectRoute.OnServerEvent:Connect(function(player, payload)
 		displayName = selectedRoute.DisplayName or routeId,
 		risk = selectedRoute.Risk or "Medium",
 	}
+
+	local timeFactor = tonumber(selectedRoute.TravelTime) or 1.0
+	if #pdata.ActiveContracts > 0 then
+		local now = os.time()
+		for _, contract in ipairs(pdata.ActiveContracts) do
+			if contract.Town == townName and contract.DueAt then
+				local remaining = math.max(30, contract.DueAt - now)
+				contract.DueAt = now + math.floor(remaining * timeFactor)
+			end
+		end
+	end
+
 	pdata.CurrentPhase = "TravelDynamicEvents"
 	Notify:FireClient(player, ("Route selected: %s (%s risk)"):format(pdata.SelectedRoute.displayName, pdata.SelectedRoute.risk))
+	if pdata.Upgrades["Tier2Automation.AutoRouteSuggestions"] or pdata.Upgrades.AutoRouteSuggestions then
+		Notify:FireClient(player, "Auto-route system updated your ETA based on route conditions.")
+	end
 	pushUI(player)
 end)
 
@@ -723,21 +984,35 @@ RequestContracts.OnServerEvent:Connect(function(player)
 		Notify:FireClient(player, "Finish active contracts first.")
 		return
 	end
-	generateContractsForPlayer(player)
-	pushUI(player)
-end)
-
-Players.PlayerAdded:Connect(function(player)
-	TownState.InitPlayer(player)
-	local pdata = getPlayerData(player)
-	if not pdata then
+	if not pdata.ReadyForDepot and #(pdata.AvailableContracts or {}) > 0 then
+		Notify:FireClient(player, "Contracts already available. Pick from the board.")
+		pushUI(player)
+		return
+	end
+	if pdata.ReadyForDepot then
+		Notify:FireClient(player, "Return to depot DropZone to start next day.")
+		pushUI(player)
 		return
 	end
 	generateContractsForPlayer(player)
 	pushUI(player)
 end)
 
+Players.PlayerAdded:Connect(function(player)
+	TownState.InitPlayer(player)
+	loadPlayerProgress(player)
+	local pdata = getPlayerData(player)
+	if not pdata then
+		return
+	end
+	if #(pdata.AvailableContracts or {}) == 0 and #(pdata.ActiveContracts or {}) == 0 then
+		generateContractsForPlayer(player)
+	end
+	pushUI(player)
+end)
+
 Players.PlayerRemoving:Connect(function(player)
+	savePlayerProgress(player)
 	TownState.RemovePlayer(player)
 	for key, _ in pairs(touchDebounce) do
 		if string.find(key, tostring(player.UserId), 1, true) == 1 then
@@ -788,7 +1063,18 @@ task.spawn(function()
 			local pdata = TownState.GetPlayerData(player)
 			if pdata then
 				clearExpiredBlocks(pdata)
+				TownState.RefreshContractDeadlines(player, os.time())
+				expireLateContractsForPlayer(player)
 			end
+		end
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(45)
+		for _, player in ipairs(Players:GetPlayers()) do
+			savePlayerProgress(player)
 		end
 	end
 end)
@@ -796,8 +1082,18 @@ end)
 initializeTowns()
 for _, player in ipairs(Players:GetPlayers()) do
 	TownState.InitPlayer(player)
-	generateContractsForPlayer(player)
+	loadPlayerProgress(player)
+	local pdata = getPlayerData(player)
+	if pdata and #(pdata.AvailableContracts or {}) == 0 and #(pdata.ActiveContracts or {}) == 0 then
+		generateContractsForPlayer(player)
+	end
 	pushUI(player)
 end
 
 broadcast()
+
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		savePlayerProgress(player)
+	end
+end)
