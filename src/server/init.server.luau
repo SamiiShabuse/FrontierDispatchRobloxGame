@@ -1,1 +1,2 @@
-print("Hello world, from server!")
+-- Logic migrated to GameServer.server.luau.
+-- Keep this file lightweight to avoid duplicate server loops/remotes.
